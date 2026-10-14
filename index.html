@@ -235,6 +235,9 @@
   .pointer-events-none {
     pointer-events: none;
   }
+  .collapse {
+    visibility: collapse;
+  }
   .invisible {
     visibility: hidden;
   }
@@ -285,9 +288,6 @@
   .top-4 {
     top: calc(var(--spacing) * 4);
   }
-  .top-6 {
-    top: calc(var(--spacing) * 6);
-  }
   .right-4 {
     right: calc(var(--spacing) * 4);
   }
@@ -299,9 +299,6 @@
   }
   .left-4 {
     left: calc(var(--spacing) * 4);
-  }
-  .left-6 {
-    left: calc(var(--spacing) * 6);
   }
   .left-\[10px\] {
     left: 10px;
@@ -489,6 +486,9 @@
   .h-20 {
     height: calc(var(--spacing) * 20);
   }
+  .h-\[3\.25rem\] {
+    height: 3.25rem;
+  }
   .h-\[56vh\] {
     height: 56vh;
   }
@@ -630,6 +630,9 @@
   }
   .cursor-pointer {
     cursor: pointer;
+  }
+  .resize {
+    resize: both;
   }
   .list-decimal {
     list-style-type: decimal;
@@ -1201,9 +1204,6 @@
   }
   .pt-9 {
     padding-top: calc(var(--spacing) * 9);
-  }
-  .pt-14 {
-    padding-top: calc(var(--spacing) * 14);
   }
   .pr-1 {
     padding-right: calc(var(--spacing) * 1);
@@ -40588,7 +40588,11 @@ const MermaidViewer = React.memo(({
       height
     });
   }, []);
-  useEffect(() => {
+  // Measured before the first paint, not after it. Measuring in an effect meant
+  // the panel's first painted frame was drawn by a camera solved against a
+  // default aspect, and the real framing arrived one frame later: the map
+  // appeared and then jumped, once, on every slide that mounts it.
+  useLayoutEffect(() => {
     const element = frameRef.current;
     if (!element) return undefined;
     readFrameSize();
@@ -40888,22 +40892,31 @@ const MermaidViewer = React.memo(({
       axes,
       table: layoutTable
     });
+    // Ids the frame has actually reserved a cell for. The rest of this block
+    // adds boxes for drawn nodes the frame missed, and each of them must be
+    // counted once and only once: the density cap is a step function of how
+    // many boxes the camera is framing (7, 10, 14), so one box counted twice
+    // can move the camera across a threshold. Counting the lens scaffold both
+    // as a framed id and as a drawn overlay zoomed the analyst's map in by 8%
+    // at beat 11.2, for a box that had been reserved all along.
+    const reserved = new Set(frameIds.filter(id => layoutTable[id]));
 
     // Nodes with no grid cell are placed by fallback, so frame them from their
-    // rendered position or they would sit outside the camera.
+    // rendered position or they would sit outside the camera. Being named in
+    // `frameIds` does not help them: a cell is what the frame is built from.
     const strayBoxes = orderedNodes.filter(node => !layoutTable[node.id]).map(node => toBox(node));
 
     // A role lens parks its scaffold in the bottom rows. Frame the scaffold boxes
     // this lens actually shows; reserving all fourteen possible positions pushed
     // the pipeline up and shrank it for the sake of space nothing occupies.
-    const overlayBoxes = usesOverlayViewport ? orderedNodes.filter(node => node.classes.has('lensOverlay') || OVERLAY_NODE_IDS.has(node.id)).map(node => toBox(node)) : [];
+    const overlayBoxes = usesOverlayViewport ? orderedNodes.filter(node => node.classes.has('lensOverlay') || OVERLAY_NODE_IDS.has(node.id)).filter(node => !reserved.has(node.id) && layoutTable[node.id]).map(node => toBox(node)) : [];
     const boxes = [...frameBoxes, ...strayBoxes, ...overlayBoxes];
     if (boxes.length === 0) return {
       scale: 1,
       tx: 0,
       ty: 0
     };
-    const frameNodeCount = frameIds.length + strayBoxes.length + overlayBoxes.length;
+    const frameNodeCount = reserved.size + strayBoxes.length + overlayBoxes.length;
     return computeAutoFitTransform(boxes, frameNodeCount, {
       viewBox,
       fitPadding,
@@ -40912,13 +40925,52 @@ const MermaidViewer = React.memo(({
     });
   }, [fitNodeIds, nodeById, orderedNodes, usesOverlayViewport, grid, zonePadding, axes, viewBox, fitPadding, projector, floorCameraScale, layoutTable]);
 
-  // Smooth animated autoFit transitions between beats (prevents jitter)
+  // The camera glides when the story moves, and cuts the rest of the time.
+  //
+  // "The story moved" means this viewer was already on screen, in a box of the
+  // same shape, showing a different diagram: the reader pressed on and is
+  // watching one drawing become another. Everything else that re-solves the fit
+  // is bookkeeping the reader did not ask for, and animating it was most of what
+  // made the map look like it refocused on every click:
+  //
+  //   - On mount there is nothing to glide from. Each chapter opener and the
+  //     first beat after it used to open with a 300ms zoom out of a framing
+  //     solved against a default aspect, which was never on screen.
+  //   - The box is re-measured more often than it looks. WebKit lays out a 9px
+  //     scrollbar gutter where the other engines draw an overlay, so its panel
+  //     settles a second time after first paint and the map swam into place in
+  //     Safari alone. A window resize is the same case, and now tracks the box
+  //     instead of chasing it.
+  //   - The labels are re-measured once the document says its web fonts are
+  //     settled, which can move the readability floor and so the camera. That is
+  //     a better reading of the same drawing, not a new drawing.
   const [animAutoFit, setAnimAutoFit] = useState(() => autoFit);
   const prevAutoFitRef = useRef(autoFit);
   const animFrameRef = useRef(null);
+  const settledRef = useRef({
+    size: null,
+    code: null
+  });
   useEffect(() => {
     const start = prevAutoFitRef.current;
     const end = autoFit;
+    const measured = frameSize.width > 0 && frameSize.height > 0;
+    const settled = settledRef.current;
+    const sameBox = Boolean(settled.size) && Math.abs(settled.size.width - frameSize.width) < 0.5 && Math.abs(settled.size.height - frameSize.height) < 0.5;
+    const storyMoved = settled.code !== null && settled.code !== (code || '');
+    settledRef.current = {
+      size: measured ? {
+        width: frameSize.width,
+        height: frameSize.height
+      } : null,
+      code: measured ? code || '' : null
+    };
+    if (!measured || !sameBox || !storyMoved) {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      prevAutoFitRef.current = end;
+      setAnimAutoFit(end);
+      return undefined;
+    }
     // Panning and zooming are what reduced motion exists to stop, and this one
     // is driven from script, where the stylesheet's reduced-motion rule cannot
     // reach it: cut straight to the new framing instead.
@@ -40949,7 +41001,7 @@ const MermaidViewer = React.memo(({
     return () => {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     };
-  }, [autoFit]);
+  }, [autoFit, code, frameSize.width, frameSize.height]);
 
   // Real pixels per drawing unit, before any readability rescue: the camera's
   // own scale times whatever `meet` does with the viewBox inside the panel.
@@ -43805,11 +43857,14 @@ function DP900LearnerHeader({
 // A milestone opener: the years it covers, what the business was trying to do,
 // the beats inside it, and the map as it stands when the milestone ends.
 function DP900MilestoneIntro({
-  cumulativeNodeIdsThrough,
+  currentIndex,
   examMilestoneRecaps,
+  frameNodeIdsFrom,
   getTrackBeatById,
+  learnerBeatTimeline,
   renderInterludeBlock,
   selectedPerspective,
+  setCurrentIndex,
   setPrepView,
   slide
 }) {
@@ -43868,9 +43923,12 @@ function DP900MilestoneIntro({
   const hasSidebarCards = Boolean(milestoneRecap || hasInterlude);
 
   // Preview the chapter's destination, then let the following beats build it.
+  // The preview is framed on the whole milestone, which is what its beats are
+  // framed on too: the end state appears here at exactly the size it will have
+  // when the beats arrive at it, so beginning the chapter moves no boxes.
   const overviewDiagram = lastMilestoneBeat?.diagram || '';
-  const lastMilestoneBeatIndex = milestoneBeatEntries[milestoneBeatEntries.length - 1]?.index ?? -1;
-  const overviewFitNodeIds = lastMilestoneBeatIndex >= 0 ? cumulativeNodeIdsThrough(lastMilestoneBeatIndex, selectedPerspective) : [];
+  const firstMilestoneBeatIndex = milestoneBeatEntries[0]?.index ?? -1;
+  const overviewFitNodeIds = firstMilestoneBeatIndex >= 0 ? frameNodeIdsFrom(firstMilestoneBeatIndex, selectedPerspective) : [];
   return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     className: "w-full lg:w-1/3 h-auto lg:h-full overflow-y-visible lg:overflow-y-auto border-r border-[#e8e6dc] bg-white p-7 lg:p-9 flex flex-col min-h-0"
   }, /*#__PURE__*/React.createElement("h1", {
@@ -43995,9 +44053,19 @@ function DP900MilestoneIntro({
   }, "\u2192"), " to begin")), /*#__PURE__*/React.createElement("div", {
     className: "w-full lg:w-2/3 h-[56vh] shrink-0 lg:shrink lg:h-full bg-[#faf9f5] relative flex flex-col overflow-hidden"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "absolute top-6 left-6 text-[10px] font-bold uppercase tracking-widest text-[#726f64] z-10 pointer-events-none"
-  }, "End-state preview \xB7 build this over ", milestoneBeatEntries.length, " beat", milestoneBeatEntries.length === 1 ? '' : 's'), overviewDiagram ? /*#__PURE__*/React.createElement("div", {
-    className: "flex-1 min-h-0 relative px-3 pt-14 pb-16 overflow-hidden"
+    className: "absolute top-3 sm:top-6 left-4 sm:left-6 text-[10px] font-bold uppercase tracking-widest text-[#726f64] z-10 pointer-events-none"
+  }, "End-state preview \xB7 ", milestoneBeatEntries.length, " beat", milestoneBeatEntries.length === 1 ? '' : 's'), overviewDiagram ?
+  /*#__PURE__*/
+  /* The same gutters the beat panel uses, to the pixel — and the same
+     caption strip and timeline below. The camera takes the shape of the
+     box it is given, so an opener whose panel reserved 64px for nothing
+     and carried no strips handed it a frame 87px taller than the beats':
+     pressing on from the preview slid every box 39px up the panel while
+     the drawing and its scale stayed the same. Now the preview is drawn
+     in the box its own beats will use, so beginning a chapter removes
+     what is not built yet and moves nothing that is. */
+  React.createElement("div", {
+    className: "flex-1 min-h-0 relative px-2 sm:px-3 pt-9 sm:pt-14 pb-1 sm:pb-2 overflow-hidden"
   }, /*#__PURE__*/React.createElement(MermaidViewer, {
     code: overviewDiagram,
     fitNodeIds: overviewFitNodeIds,
@@ -44006,7 +44074,17 @@ function DP900MilestoneIntro({
     className: "flex-1 flex items-center justify-center"
   }, /*#__PURE__*/React.createElement("p", {
     className: "text-[#726f64] text-sm italic"
-  }, "Diagram appears in the first beat"))));
+  }, "Diagram appears in the first beat")), lastMilestoneBeat?.caption && /*#__PURE__*/React.createElement("div", {
+    "data-beat-caption": "true",
+    className: "shrink-0 h-[3.25rem] overflow-y-auto px-6 py-2 text-xs leading-snug text-[#6a6a68] italic border-t border-[#e8e6dc] bg-white/70"
+  }, lastMilestoneBeat.caption), /*#__PURE__*/React.createElement("div", {
+    "data-learner-timeline": "true",
+    className: "shrink-0 px-4 pb-2 border-t border-[#e8e6dc] bg-[#faf9f5]"
+  }, /*#__PURE__*/React.createElement(DP900TimelineScrubber, {
+    items: learnerBeatTimeline,
+    currentIndex: currentIndex,
+    onSelect: setCurrentIndex
+  }))));
 }
 
 // The screens that are not beats and not milestones: the title, the prologue,
@@ -46319,7 +46397,8 @@ function DP900BeatPanel({
     rel: "noreferrer",
     className: "text-sm text-[#1a3a5c] underline decoration-[#b8cde4] underline-offset-2 hover:decoration-[#1a3a5c]"
   }, doc.title)))))), slide.caption && /*#__PURE__*/React.createElement("div", {
-    className: "shrink-0 px-6 py-2 text-xs leading-snug text-[#6a6a68] italic border-t border-[#e8e6dc] bg-white/70"
+    "data-beat-caption": "true",
+    className: "shrink-0 h-[3.25rem] overflow-y-auto px-6 py-2 text-xs leading-snug text-[#6a6a68] italic border-t border-[#e8e6dc] bg-white/70"
   }, slide.caption), /*#__PURE__*/React.createElement("div", {
     "data-learner-timeline": "true",
     className: "shrink-0 px-4 pb-2 border-t border-[#e8e6dc] bg-[#faf9f5]"
@@ -47601,20 +47680,56 @@ function App() {
     return map;
   }, [trackFilteredIndices]);
 
-  // Every node the architecture has held from the first beat up to and including
-  // the given one, for the active track. The diagram frames this cumulative set,
-  // so the camera only ever pulls back: each beat is composed tightly around the
-  // architecture so far, and nothing already on the map jumps when something new
-  // arrives. Framing a whole milestone ahead of time instead left early beats as
-  // two boxes in the corner of space reserved for services not yet introduced.
-  const cumulativeNodeIdsThrough = React.useCallback((beatIndex, trackKey) => {
+  // Every node this beat and the rest of its milestone will draw, for the active
+  // track. The diagram frames that set, so the camera holds still while a
+  // milestone plays out: the space a service will need is already reserved when
+  // it arrives, and nothing on the map moves to make room for it.
+  //
+  // Framing the whole 28-beat grid at all times left the first milestones as two
+  // boxes in a mostly empty field. Framing each beat on the architecture built so
+  // far composed every beat tightly — and re-zoomed on almost every click, since
+  // a beat that adds a node in a new row re-indexes the grid and slides
+  // everything already drawn.
+  //
+  // Looking forward rather than back is also what lets the Fabric collapse take
+  // its space back: a beat that retires services is framed on what survives it,
+  // so it is the only kind of beat that reframes inside a milestone. That one is
+  // the scene, not noise.
+  const frameNodeIdsFrom = React.useCallback((beatIndex, trackKey) => {
+    const start = slidesData[beatIndex];
+    if (!start) return [];
+    const lens = trackKey && trackKey !== 'business' ? String(trackKey) : '';
+    let first = beatIndex;
+    while (first > 0 && slidesData[first - 1]?.m === start.m) first -= 1;
     const ids = new Set();
-    for (let i = 0; i <= beatIndex && i < slidesData.length; i += 1) {
+    for (let i = first; i < slidesData.length; i += 1) {
       const s = slidesData[i];
+      if (s?.m !== start.m) break;
       if (s?.type !== 'beat') continue;
       const beat = getTrackBeatById(s.beatId, trackKey) || s;
       const graph = parseMermaidFlowchart(beat?.diagram || '');
-      for (const id of graph.nodes.keys()) ids.add(id);
+      // The architecture is framed from this beat onward, so a beat that retires
+      // a service is framed on what survives it.
+      if (i >= beatIndex) {
+        for (const id of graph.nodes.keys()) ids.add(id);
+      }
+      // The role lens scaffold is framed for the whole chapter, in both
+      // directions. Those boxes are not the architecture and they do not retire:
+      // the lens shows a fixed number of them and swaps which, so the analyst's
+      // BI nouns giving way to a workspace and row security at beat 11.2 pulled
+      // the entire pipeline 8% larger for a reason the story never mentions.
+      // Which boxes a lens picks reads the role, the milestone and the services
+      // drawn — never the diff — so an empty diff is enough to ask it.
+      if (!lens) continue;
+      const lensed = parseMermaidFlowchart(applyRoleLensToMermaid(beat?.diagram || '', {
+        roleKey: lens,
+        slide: beat?.beatId ? beat : s,
+        currGraph: graph,
+        diff: {}
+      }));
+      for (const id of lensed.nodes.keys()) {
+        if (!graph.nodes.has(id)) ids.add(id);
+      }
     }
     return [...ids].sort();
   }, [getTrackBeatById]);
@@ -47668,7 +47783,7 @@ function App() {
         to
       };
     }) : [];
-    const milestoneNodeIds = cumulativeNodeIdsThrough(currentIndex, activeTrackKey);
+    const milestoneNodeIds = frameNodeIdsFrom(currentIndex, activeTrackKey);
     return {
       prevBeat,
       currBeat,
@@ -47682,7 +47797,7 @@ function App() {
       focusChips,
       milestoneNodeIds
     };
-  }, [baseSlide, activeTrackBeat, activeTrackKey, currentIndex, getTrackBeatById, cumulativeNodeIdsThrough]);
+  }, [baseSlide, activeTrackBeat, activeTrackKey, currentIndex, getTrackBeatById, frameNodeIdsFrom]);
   useEffect(() => {
     if (presentationMode || examMode || prepView) return undefined;
     const handleKeyDown = event => {
@@ -47992,9 +48107,12 @@ function App() {
     showRoots: showRoots,
     slide: slide
   }), /*#__PURE__*/React.createElement(DP900MilestoneIntro, {
-    cumulativeNodeIdsThrough: cumulativeNodeIdsThrough,
+    currentIndex: currentIndex,
     examMilestoneRecaps: examMilestoneRecaps,
+    frameNodeIdsFrom: frameNodeIdsFrom,
     getTrackBeatById: getTrackBeatById,
+    learnerBeatTimeline: learnerBeatTimeline,
+    setCurrentIndex: setCurrentIndex,
     renderInterludeBlock: renderInterludeBlock,
     selectedPerspective: selectedPerspective,
     setPrepView: setPrepView,
