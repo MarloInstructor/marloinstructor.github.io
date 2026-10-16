@@ -2465,6 +2465,19 @@
   }
 }
 
+/* Every full-page surface sizes itself against the mount point: the learner
+   shell is `h-screen`, the prep surfaces (plan, handout, review queue) are
+   `h-full`, and `<body>` is `overflow-hidden` because the deck scrolls inside
+   its panels rather than as a page. #root therefore has to be the viewport. Left
+   at `height: auto`, `h-full` resolves to auto too, the `overflow-y-auto` panel
+   inside it grows to fit its content instead of scrolling, and body's
+   `overflow: hidden` clips the rest: the core-concepts handout stood 20,296px
+   tall in a 900px window with no way to reach any of it. */
+#root {
+    height: 100vh;
+    height: 100dvh;
+}
+
 @keyframes fadeIn {
     0% { opacity: 0; transform: translateY(8px); }
     100% { opacity: 1; transform: translateY(0); }
